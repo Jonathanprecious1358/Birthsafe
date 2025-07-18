@@ -1,4 +1,5 @@
 (define-fungible-token birthsafe-token)
+(define-non-fungible-token birth-certificate uint)
 
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
@@ -9,6 +10,10 @@
 (define-constant err-reward-claimed (err u105))
 (define-constant err-insufficient-funds (err u106))
 (define-constant err-time-expired (err u107))
+(define-constant err-not-authorized (err u108))
+(define-constant err-certificate-exists (err u109))
+(define-constant err-invalid-metadata (err u110))
+(define-constant err-transfer-failed (err u111))
 
 (define-data-var token-name (string-ascii 32) "Safe Birth Token")
 (define-data-var token-symbol (string-ascii 10) "SBT")
@@ -16,6 +21,7 @@
 (define-data-var total-supply uint u0)
 (define-data-var reward-amount uint u1000000)
 (define-data-var reward-expiry-blocks uint u144000)
+(define-data-var certificate-counter uint u0)
 
 (define-map hospitals principal {
     name: (string-ascii 64),
@@ -45,6 +51,25 @@
     total-deliveries: uint,
     successful-deliveries: uint,
     total-rewards-distributed: uint
+})
+
+(define-map birth-certificates uint {
+    birth-id: (string-ascii 32),
+    mother: principal,
+    hospital: principal,
+    issued-block: uint,
+    metadata-uri: (string-ascii 256),
+    verification-status: (string-ascii 32),
+    transferable: bool
+})
+
+(define-map certificate-birth-mapping (string-ascii 32) uint)
+
+(define-map certificate-metadata uint {
+    child-name: (string-ascii 64),
+    birth-place: (string-ascii 128),
+    birth-time: (string-ascii 32),
+    additional-info: (string-ascii 256)
 })
 
 (define-read-only (get-name)
@@ -276,4 +301,160 @@
         reward-expiry-blocks: (var-get reward-expiry-blocks),
         current-block: stacks-block-height
     })
+)
+
+(define-read-only (get-certificate (certificate-id uint))
+    (map-get? birth-certificates certificate-id)
+)
+
+(define-read-only (get-certificate-metadata (certificate-id uint))
+    (map-get? certificate-metadata certificate-id)
+)
+
+(define-read-only (get-certificate-owner (certificate-id uint))
+    (nft-get-owner? birth-certificate certificate-id)
+)
+
+(define-read-only (get-certificate-by-birth-id (birth-id (string-ascii 32)))
+    (match (map-get? certificate-birth-mapping birth-id)
+        certificate-id (map-get? birth-certificates certificate-id)
+        none
+    )
+)
+
+(define-read-only (get-certificate-count)
+    (ok (var-get certificate-counter))
+)
+
+(define-public (issue-birth-certificate 
+    (birth-id (string-ascii 32))
+    (child-name (string-ascii 64))
+    (birth-place (string-ascii 128))
+    (birth-time (string-ascii 32))
+    (metadata-uri (string-ascii 256))
+    (additional-info (string-ascii 256))
+)
+    (let (
+        (birth-data (unwrap! (map-get? births birth-id) err-not-found))
+        (mother (get mother birth-data))
+        (hospital (get hospital birth-data))
+        (current-block stacks-block-height)
+        (new-certificate-id (+ (var-get certificate-counter) u1))
+    )
+    (asserts! (is-eq tx-sender hospital) err-not-authorized)
+    (asserts! (get verified birth-data) err-invalid-birth)
+    (asserts! (is-none (map-get? certificate-birth-mapping birth-id)) err-certificate-exists)
+    (asserts! (> (len child-name) u0) err-invalid-metadata)
+    (asserts! (> (len birth-place) u0) err-invalid-metadata)
+    
+    (try! (nft-mint? birth-certificate new-certificate-id mother))
+    
+    (map-set birth-certificates new-certificate-id {
+        birth-id: birth-id,
+        mother: mother,
+        hospital: hospital,
+        issued-block: current-block,
+        metadata-uri: metadata-uri,
+        verification-status: "verified",
+        transferable: true
+    })
+    
+    (map-set certificate-birth-mapping birth-id new-certificate-id)
+    
+    (map-set certificate-metadata new-certificate-id {
+        child-name: child-name,
+        birth-place: birth-place,
+        birth-time: birth-time,
+        additional-info: additional-info
+    })
+    
+    (var-set certificate-counter new-certificate-id)
+    (ok new-certificate-id))
+)
+
+(define-public (transfer-certificate (certificate-id uint) (recipient principal))
+    (let (
+        (certificate-data (unwrap! (map-get? birth-certificates certificate-id) err-not-found))
+        (current-owner (unwrap! (nft-get-owner? birth-certificate certificate-id) err-not-found))
+    )
+    (asserts! (is-eq tx-sender current-owner) err-not-authorized)
+    (asserts! (get transferable certificate-data) err-not-authorized)
+    (unwrap! (nft-transfer? birth-certificate certificate-id current-owner recipient) err-transfer-failed)
+    (ok true))
+)
+
+(define-public (update-certificate-metadata 
+    (certificate-id uint)
+    (new-metadata-uri (string-ascii 256))
+)
+    (let (
+        (certificate-data (unwrap! (map-get? birth-certificates certificate-id) err-not-found))
+        (hospital (get hospital certificate-data))
+    )
+    (asserts! (is-eq tx-sender hospital) err-not-authorized)
+    (asserts! (> (len new-metadata-uri) u0) err-invalid-metadata)
+    (map-set birth-certificates certificate-id (merge certificate-data {metadata-uri: new-metadata-uri}))
+    (ok true))
+)
+
+(define-public (revoke-certificate (certificate-id uint))
+    (let (
+        (certificate-data (unwrap! (map-get? birth-certificates certificate-id) err-not-found))
+        (hospital (get hospital certificate-data))
+    )
+    (asserts! (or (is-eq tx-sender contract-owner) (is-eq tx-sender hospital)) err-not-authorized)
+    (map-set birth-certificates certificate-id (merge certificate-data {verification-status: "revoked"}))
+    (ok true))
+)
+
+(define-public (set-certificate-transferable (certificate-id uint) (transferable bool))
+    (let (
+        (certificate-data (unwrap! (map-get? birth-certificates certificate-id) err-not-found))
+        (hospital (get hospital certificate-data))
+    )
+    (asserts! (or (is-eq tx-sender contract-owner) (is-eq tx-sender hospital)) err-not-authorized)
+    (map-set birth-certificates certificate-id (merge certificate-data {transferable: transferable}))
+    (ok true))
+)
+
+(define-public (verify-certificate-authenticity (certificate-id uint))
+    (let (
+        (certificate-data (unwrap! (map-get? birth-certificates certificate-id) err-not-found))
+        (birth-id (get birth-id certificate-data))
+        (birth-data (unwrap! (map-get? births birth-id) err-not-found))
+        (hospital (get hospital certificate-data))
+        (hospital-data (unwrap! (map-get? hospitals hospital) err-not-found))
+    )
+    (ok {
+        is-authentic: (and 
+            (is-eq (get verification-status certificate-data) "verified")
+            (get verified birth-data)
+            (get verified hospital-data)
+        ),
+        issued-by: hospital,
+        issued-block: (get issued-block certificate-data),
+        birth-verified: (get verified birth-data),
+        hospital-verified: (get verified hospital-data)
+    }))
+)
+
+(define-read-only (get-certificates-by-owner (owner principal))
+    (ok {
+        owner: owner,
+        total-certificates: (var-get certificate-counter)
+    })
+)
+
+(define-read-only (get-certificate-info (certificate-id uint))
+    (match (map-get? birth-certificates certificate-id)
+        certificate-data (match (map-get? certificate-metadata certificate-id)
+            metadata (ok {
+                certificate: certificate-data,
+                metadata: metadata,
+                owner: (nft-get-owner? birth-certificate certificate-id)
+            })
+            (err err-not-found)
+        )
+        (err err-not-found)
+    )
 )
