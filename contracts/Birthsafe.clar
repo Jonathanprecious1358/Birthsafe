@@ -14,6 +14,13 @@
 (define-constant err-certificate-exists (err u109))
 (define-constant err-invalid-metadata (err u110))
 (define-constant err-transfer-failed (err u111))
+(define-constant err-supply-not-found (err u112))
+(define-constant err-invalid-supplier (err u113))
+(define-constant err-invalid-quantity (err u114))
+(define-constant err-supply-already-delivered (err u115))
+(define-constant err-insufficient-supply (err u116))
+(define-constant err-invalid-batch (err u117))
+(define-constant err-expired-supply (err u118))
 
 (define-data-var token-name (string-ascii 32) "Safe Birth Token")
 (define-data-var token-symbol (string-ascii 10) "SBT")
@@ -22,6 +29,8 @@
 (define-data-var reward-amount uint u1000000)
 (define-data-var reward-expiry-blocks uint u144000)
 (define-data-var certificate-counter uint u0)
+(define-data-var supply-counter uint u0)
+(define-data-var supply-batch-counter uint u0)
 
 (define-map hospitals principal {
     name: (string-ascii 64),
@@ -70,6 +79,58 @@
     birth-place: (string-ascii 128),
     birth-time: (string-ascii 32),
     additional-info: (string-ascii 256)
+})
+
+(define-map medical-suppliers principal {
+    company-name: (string-ascii 64),
+    contact-info: (string-ascii 128),
+    verified: bool,
+    registration-block: uint,
+    total-supplies-delivered: uint
+})
+
+(define-map supply-batches uint {
+    supplier: principal,
+    batch-number: (string-ascii 32),
+    supply-type: (string-ascii 64),
+    total-quantity: uint,
+    remaining-quantity: uint,
+    unit-price: uint,
+    manufacturing-date: (string-ascii 16),
+    expiry-date: (string-ascii 16),
+    quality-status: (string-ascii 32),
+    created-block: uint
+})
+
+(define-map supply-orders uint {
+    hospital: principal,
+    supplier: principal,
+    batch-id: uint,
+    ordered-quantity: uint,
+    delivered-quantity: uint,
+    order-status: (string-ascii 32),
+    order-date: (string-ascii 16),
+    expected-delivery: (string-ascii 16),
+    actual-delivery: (string-ascii 16),
+    order-block: uint,
+    delivery-block: uint
+})
+
+(define-map hospital-inventory principal {
+    total-orders: uint,
+    pending-orders: uint,
+    completed-orders: uint,
+    total-supplies-received: uint,
+    inventory-value: uint
+})
+
+(define-map supply-delivery-tracking uint {
+    order-id: uint,
+    current-location: (string-ascii 128),
+    delivery-status: (string-ascii 32),
+    estimated-arrival: (string-ascii 16),
+    last-update-block: uint,
+    transportation-method: (string-ascii 64)
 })
 
 (define-read-only (get-name)
@@ -326,6 +387,46 @@
     (ok (var-get certificate-counter))
 )
 
+(define-read-only (get-medical-supplier (supplier-principal principal))
+    (map-get? medical-suppliers supplier-principal)
+)
+
+(define-read-only (get-supply-batch (batch-id uint))
+    (map-get? supply-batches batch-id)
+)
+
+(define-read-only (get-supply-order (order-id uint))
+    (map-get? supply-orders order-id)
+)
+
+(define-read-only (get-hospital-inventory (hospital principal))
+    (map-get? hospital-inventory hospital)
+)
+
+(define-read-only (get-supply-tracking (order-id uint))
+    (map-get? supply-delivery-tracking order-id)
+)
+
+(define-read-only (get-supply-statistics)
+    (ok {
+        total-batches: (var-get supply-batch-counter),
+        total-orders: (var-get supply-counter),
+        current-block: stacks-block-height
+    })
+)
+
+(define-read-only (check-batch-expiry (batch-id uint))
+    (match (map-get? supply-batches batch-id)
+        batch-data (ok {
+            batch-id: batch-id,
+            expiry-date: (get expiry-date batch-data),
+            is-expired: false,
+            remaining-quantity: (get remaining-quantity batch-data)
+        })
+        (err err-supply-not-found)
+    )
+)
+
 (define-public (issue-birth-certificate 
     (birth-id (string-ascii 32))
     (child-name (string-ascii 64))
@@ -458,3 +559,220 @@
         (err err-not-found)
     )
 )
+
+(define-public (register-medical-supplier 
+    (company-name (string-ascii 64))
+    (contact-info (string-ascii 128))
+)
+    (let (
+        (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-none (map-get? medical-suppliers tx-sender)) err-already-exists)
+    (asserts! (> (len company-name) u0) err-invalid-metadata)
+    (map-set medical-suppliers tx-sender {
+        company-name: company-name,
+        contact-info: contact-info,
+        verified: true,
+        registration-block: current-block,
+        total-supplies-delivered: u0
+    })
+    (ok true))
+)
+
+(define-public (create-supply-batch
+    (batch-number (string-ascii 32))
+    (supply-type (string-ascii 64))
+    (total-quantity uint)
+    (unit-price uint)
+    (manufacturing-date (string-ascii 16))
+    (expiry-date (string-ascii 16))
+)
+    (let (
+        (supplier-data (unwrap! (map-get? medical-suppliers tx-sender) err-invalid-supplier))
+        (current-block stacks-block-height)
+        (new-batch-id (+ (var-get supply-batch-counter) u1))
+    )
+    (asserts! (get verified supplier-data) err-invalid-supplier)
+    (asserts! (> total-quantity u0) err-invalid-quantity)
+    (asserts! (> unit-price u0) err-invalid-quantity)
+    (asserts! (> (len batch-number) u0) err-invalid-batch)
+    (asserts! (> (len supply-type) u0) err-invalid-metadata)
+    
+    (map-set supply-batches new-batch-id {
+        supplier: tx-sender,
+        batch-number: batch-number,
+        supply-type: supply-type,
+        total-quantity: total-quantity,
+        remaining-quantity: total-quantity,
+        unit-price: unit-price,
+        manufacturing-date: manufacturing-date,
+        expiry-date: expiry-date,
+        quality-status: "approved",
+        created-block: current-block
+    })
+    
+    (var-set supply-batch-counter new-batch-id)
+    (ok new-batch-id))
+)
+
+(define-public (place-supply-order
+    (supplier principal)
+    (batch-id uint)
+    (ordered-quantity uint)
+    (order-date (string-ascii 16))
+    (expected-delivery (string-ascii 16))
+)
+    (let (
+        (hospital-data (unwrap! (map-get? hospitals tx-sender) err-invalid-hospital))
+        (supplier-data (unwrap! (map-get? medical-suppliers supplier) err-invalid-supplier))
+        (batch-data (unwrap! (map-get? supply-batches batch-id) err-supply-not-found))
+        (current-block stacks-block-height)
+        (new-order-id (+ (var-get supply-counter) u1))
+    )
+    (asserts! (get verified hospital-data) err-invalid-hospital)
+    (asserts! (get verified supplier-data) err-invalid-supplier)
+    (asserts! (> ordered-quantity u0) err-invalid-quantity)
+    (asserts! (<= ordered-quantity (get remaining-quantity batch-data)) err-insufficient-supply)
+    (asserts! (is-eq (get supplier batch-data) supplier) err-invalid-supplier)
+    
+    (map-set supply-orders new-order-id {
+        hospital: tx-sender,
+        supplier: supplier,
+        batch-id: batch-id,
+        ordered-quantity: ordered-quantity,
+        delivered-quantity: u0,
+        order-status: "pending",
+        order-date: order-date,
+        expected-delivery: expected-delivery,
+        actual-delivery: "",
+        order-block: current-block,
+        delivery-block: u0
+    })
+    
+    (map-set supply-batches batch-id 
+        (merge batch-data {
+            remaining-quantity: (- (get remaining-quantity batch-data) ordered-quantity)
+        })
+    )
+    
+    (map-set hospital-inventory tx-sender
+        (merge (default-to {
+            total-orders: u0,
+            pending-orders: u0,
+            completed-orders: u0,
+            total-supplies-received: u0,
+            inventory-value: u0
+        } (map-get? hospital-inventory tx-sender))
+        {
+            total-orders: (+ (get total-orders (default-to {
+                total-orders: u0,
+                pending-orders: u0,
+                completed-orders: u0,
+                total-supplies-received: u0,
+                inventory-value: u0
+            } (map-get? hospital-inventory tx-sender))) u1),
+            pending-orders: (+ (get pending-orders (default-to {
+                total-orders: u0,
+                pending-orders: u0,
+                completed-orders: u0,
+                total-supplies-received: u0,
+                inventory-value: u0
+            } (map-get? hospital-inventory tx-sender))) u1)
+        })
+    )
+    
+    (map-set supply-delivery-tracking new-order-id {
+        order-id: new-order-id,
+        current-location: "supplier-warehouse",
+        delivery-status: "preparing",
+        estimated-arrival: expected-delivery,
+        last-update-block: current-block,
+        transportation-method: "standard"
+    })
+    
+    (var-set supply-counter new-order-id)
+    (ok new-order-id))
+)
+
+(define-public (update-delivery-status
+    (order-id uint)
+    (current-location (string-ascii 128))
+    (delivery-status (string-ascii 32))
+    (estimated-arrival (string-ascii 16))
+    (transportation-method (string-ascii 64))
+)
+    (let (
+        (order-data (unwrap! (map-get? supply-orders order-id) err-supply-not-found))
+        (supplier (get supplier order-data))
+        (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender supplier) err-not-authorized)
+    (asserts! (> (len current-location) u0) err-invalid-metadata)
+    (asserts! (> (len delivery-status) u0) err-invalid-metadata)
+    
+    (map-set supply-delivery-tracking order-id {
+        order-id: order-id,
+        current-location: current-location,
+        delivery-status: delivery-status,
+        estimated-arrival: estimated-arrival,
+        last-update-block: current-block,
+        transportation-method: transportation-method
+    })
+    (ok true))
+)
+
+(define-public (confirm-delivery
+    (order-id uint)
+    (delivered-quantity uint)
+    (actual-delivery-date (string-ascii 16))
+)
+    (let (
+        (order-data (unwrap! (map-get? supply-orders order-id) err-supply-not-found))
+        (hospital (get hospital order-data))
+        (supplier (get supplier order-data))
+        (batch-id (get batch-id order-data))
+        (batch-data (unwrap! (map-get? supply-batches batch-id) err-supply-not-found))
+        (current-block stacks-block-height)
+        (order-value (* delivered-quantity (get unit-price batch-data)))
+    )
+    (asserts! (is-eq tx-sender hospital) err-not-authorized)
+    (asserts! (> delivered-quantity u0) err-invalid-quantity)
+    (asserts! (<= delivered-quantity (get ordered-quantity order-data)) err-invalid-quantity)
+    (asserts! (is-eq (get order-status order-data) "pending") err-supply-already-delivered)
+    
+    (map-set supply-orders order-id
+        (merge order-data {
+            delivered-quantity: delivered-quantity,
+            order-status: "completed",
+            actual-delivery: actual-delivery-date,
+            delivery-block: current-block
+        })
+    )
+    
+    (map-set hospital-inventory hospital
+        (merge (unwrap! (map-get? hospital-inventory hospital) err-not-found)
+        {
+            pending-orders: (- (get pending-orders (unwrap! (map-get? hospital-inventory hospital) err-not-found)) u1),
+            completed-orders: (+ (get completed-orders (unwrap! (map-get? hospital-inventory hospital) err-not-found)) u1),
+            total-supplies-received: (+ (get total-supplies-received (unwrap! (map-get? hospital-inventory hospital) err-not-found)) delivered-quantity),
+            inventory-value: (+ (get inventory-value (unwrap! (map-get? hospital-inventory hospital) err-not-found)) order-value)
+        })
+    )
+    
+    (map-set medical-suppliers supplier
+        (merge (unwrap! (map-get? medical-suppliers supplier) err-invalid-supplier)
+        {total-supplies-delivered: (+ (get total-supplies-delivered (unwrap! (map-get? medical-suppliers supplier) err-invalid-supplier)) delivered-quantity)}
+        )
+    )
+    
+    (map-set supply-delivery-tracking order-id
+        (merge (unwrap! (map-get? supply-delivery-tracking order-id) err-supply-not-found)
+        {
+            delivery-status: "delivered",
+            last-update-block: current-block
+        })
+    )
+    (ok delivered-quantity))
+)
+
